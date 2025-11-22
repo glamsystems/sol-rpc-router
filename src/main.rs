@@ -1,9 +1,9 @@
 use axum::{
-    body::Body,
+    body::{to_bytes, Body},
     extract::{Query, State},
     http::{Request, StatusCode, Uri},
     response::IntoResponse,
-    routing::any,
+    routing::post,
     Router,
 };
 use axum::{
@@ -22,6 +22,11 @@ use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber;
 
+const MAX_BODY_SIZE: usize = 10 * 1024 * 1024; // 10 MB
+
+#[derive(Clone)]
+struct RpcMethod(String);
+
 #[derive(Clone)]
 struct AppState {
     client: Client<HttpsConnector<HttpConnector>, Body>,
@@ -35,6 +40,31 @@ struct Params {
     api_key: Option<String>,
 }
 
+pub async fn extract_rpc_method(mut req: Request<Body>, next: Next) -> Response {
+    // Read body, extract "method" field, then reconstruct the request
+    let (parts, body) = req.into_parts();
+    let body_bytes = match to_bytes(body, MAX_BODY_SIZE).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            // If body read fails, pass empty body downstream
+            return next.run(Request::from_parts(parts, Body::empty())).await;
+        }
+    };
+
+    // Try to extract "method" from JSON
+    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+        if let Some(method) = json.get("method").and_then(|m| m.as_str()) {
+            req = Request::from_parts(parts, Body::from(body_bytes.clone()));
+            req.extensions_mut().insert(RpcMethod(method.to_string()));
+            return next.run(req).await;
+        }
+    }
+
+    // If no method found, reconstruct request with original body
+    req = Request::from_parts(parts, Body::from(body_bytes));
+    next.run(req).await
+}
+
 pub async fn log_requests(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     req: Request<Body>,
@@ -42,12 +72,19 @@ pub async fn log_requests(
 ) -> Response {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+    let rpc_method = req.extensions().get::<RpcMethod>().cloned();
 
     let start = std::time::Instant::now();
     let response = next.run(req).await;
     let duration = start.elapsed();
 
-    info!("{} {} {} {:?}", method, path, addr, duration);
+    match rpc_method {
+        Some(RpcMethod(m)) => info!(
+            "{} {} {} {:?} rpc_method={}",
+            method, path, addr, duration, m
+        ),
+        None => info!("{} {} {} {:?}", method, path, addr, duration),
+    }
 
     response
 }
@@ -58,9 +95,7 @@ async fn proxy(
     mut req: Request<Body>,
 ) -> impl IntoResponse {
     match params.api_key {
-        Some(ref key) if state.api_keys.contains(key) => {
-            info!("API key '{}' is valid", key);
-        }
+        Some(ref key) if state.api_keys.contains(key) => {}
         Some(ref key) => {
             info!("API key '{}' is invalid", key);
             return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
@@ -153,10 +188,11 @@ async fn main() {
     });
 
     let app = Router::new()
-        .route("/", any(proxy))
-        .route("/*path", any(proxy))
+        .route("/", post(proxy))
+        .route("/*path", post(proxy))
         .with_state(state)
-        .layer(middleware::from_fn(log_requests));
+        .layer(middleware::from_fn(log_requests))
+        .layer(middleware::from_fn(extract_rpc_method));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     println!("Listening on http://{}", addr);
