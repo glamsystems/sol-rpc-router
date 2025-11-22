@@ -1,0 +1,49 @@
+# Example configuration for RPC Proxy
+# Copy this file to config.toml and customize
+
+# Server port
+port = 28899
+
+# API keys for authentication
+# Requests must include ?api-key=<key> in the query string
+api_keys = ["your-api-key-1", "your-api-key-2", "your-api-key-3"]
+
+# Backend RPC endpoints with weights
+# Weight determines the probability of selection for load balancing:
+# - Backend with weight 2 gets 2x more requests than weight 1
+# - Total weight = sum of all weights
+# - Probability = backend_weight / total_weight
+#
+# Example: With weights 2, 3, 1 (total=6):
+#   - First backend:  2/6 = 33.3% of requests
+#   - Second backend: 3/6 = 50.0% of requests
+#   - Third backend:  1/6 = 16.7% of requests
+
+[[backends]]
+url = "https://api.mainnet-beta.solana.com"
+weight = 2
+
+[[backends]]
+url = "https://some-solana-rpc.com"
+weight = 3
+
+[[backends]]
+url = "https://another-solana-rpc.com"
+weight = 1
+
+# Method-specific routing overrides (optional)
+# Force certain RPC methods to always use a specific backend
+# This is useful for methods that work better on certain providers
+# or for cost optimization
+#
+# IMPORTANT: Method names are CASE-SENSITIVE and must match exactly
+# what appears in the JSON-RPC "method" field
+#
+# Uncomment and customize as needed:
+
+[method_routes]
+# Route transaction submissions to a specific high-performance backend
+# sendTransaction = "https://api.mainnet-beta.solana.com"
+# 
+# Route account queries to a different backend
+# getAccountInfo = "https://some-solana-rpc.com"

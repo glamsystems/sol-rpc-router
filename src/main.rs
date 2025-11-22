@@ -11,12 +11,14 @@ use axum::{
     middleware::{self, Next},
     response::Response,
 };
-use dotenv::dotenv;
+use clap::Parser;
 use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
+use rand::Rng;
 use serde::Deserialize;
-use std::env;
+use std::collections::HashMap;
+use std::fs;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::info;
@@ -24,20 +26,103 @@ use tracing_subscriber;
 
 const MAX_BODY_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 
+/// RPC Proxy with weighted load balancing and method-based routing
+#[derive(Parser, Debug)]
+#[command(name = "rpc-proxy")]
+#[command(about = "High-performance RPC proxy with load balancing", long_about = None)]
+struct Args {
+    /// Path to configuration file
+    #[arg(short, long, default_value = "config.toml")]
+    config: String,
+}
+
 #[derive(Clone)]
 struct RpcMethod(String);
+
+#[derive(Debug, Deserialize, Clone)]
+struct Config {
+    port: u16,
+    api_keys: Vec<String>,
+    backends: Vec<Backend>,
+    #[serde(default)]
+    method_routes: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct Backend {
+    url: String,
+    #[serde(default = "default_weight")]
+    weight: u32,
+}
+
+fn default_weight() -> u32 {
+    1
+}
 
 #[derive(Clone)]
 struct AppState {
     client: Client<HttpsConnector<HttpConnector>, Body>,
-    backend: String,
+    backends: Vec<Backend>,
+    total_weight: u32,
     api_keys: Vec<String>,
+    method_routes: HashMap<String, String>,
+}
+
+impl AppState {
+    fn select_backend(&self, rpc_method: Option<&str>) -> &str {
+        // Check method-specific routing first
+        if let Some(method) = rpc_method {
+            if let Some(backend_url) = self.method_routes.get(method) {
+                info!("Method {} routed to {}", method, backend_url);
+                return backend_url;
+            }
+        }
+
+        // Weighted random selection
+        let mut rng = rand::thread_rng();
+        let mut random_weight = rng.gen_range(0..self.total_weight);
+
+        for backend in &self.backends {
+            if random_weight < backend.weight {
+                return &backend.url;
+            }
+            random_weight -= backend.weight;
+        }
+
+        // Fallback (should never reach here if weights are valid)
+        &self.backends[0].url
+    }
 }
 
 #[derive(Deserialize)]
 struct Params {
     #[serde(rename = "api-key")]
     api_key: Option<String>,
+}
+
+fn load_config(config_path: &str) -> Result<Config, Box<dyn std::error::Error>> {
+    if !std::path::Path::new(config_path).exists() {
+        return Err(format!("Configuration file not found: {}", config_path).into());
+    }
+
+    // Read TOML file directly to preserve case sensitivity
+    let contents = fs::read_to_string(config_path)?;
+    let config: Config = toml::from_str(&contents)?;
+
+    // Validation
+    if config.api_keys.is_empty() {
+        return Err("At least one API key must be configured".into());
+    }
+    if config.backends.is_empty() {
+        return Err("At least one backend must be configured".into());
+    }
+    for backend in &config.backends {
+        if backend.weight == 0 {
+            return Err(format!("Backend {} has invalid weight 0", backend.url).into());
+        }
+    }
+
+    Ok(config)
 }
 
 pub async fn extract_rpc_method(mut req: Request<Body>, next: Next) -> Response {
@@ -106,7 +191,13 @@ async fn proxy(
         }
     }
 
-    // Rebuild URI (remove ?api-key=... from request, but preserve backend's api-key)
+    // Get RPC method from extension (set by extract_rpc_method middleware)
+    let rpc_method = req.extensions().get::<RpcMethod>().map(|m| m.0.as_str());
+
+    // Select backend based on method routing or weighted random
+    let backend_url = state.select_backend(rpc_method);
+
+    // Rebuild URI (remove ?api-key=... from request)
     let request_path_and_query = req
         .uri()
         .path_and_query()
@@ -120,15 +211,15 @@ async fn proxy(
         request_path_and_query
     };
 
-    // Avoid double slashes and trailing slashes
+    // Build URI with selected backend
     let uri_string = if cleaned_request_path == "/" {
         // For root path requests, don't add trailing slash
-        state.backend.trim_end_matches('/').to_string()
-    } else if state.backend.ends_with('/') && cleaned_request_path.starts_with('/') {
+        backend_url.trim_end_matches('/').to_string()
+    } else if backend_url.ends_with('/') && cleaned_request_path.starts_with('/') {
         // Avoid double slashes
-        format!("{}{}", state.backend, &cleaned_request_path[1..])
+        format!("{}{}", backend_url, &cleaned_request_path[1..])
     } else {
-        format!("{}{}", state.backend, cleaned_request_path)
+        format!("{}{}", backend_url, cleaned_request_path)
     };
     let parsed_uri = uri_string.parse::<Uri>().unwrap();
 
@@ -157,34 +248,36 @@ async fn proxy(
 
 #[tokio::main]
 async fn main() {
-    // Load environment variables from .env file
-    dotenv().ok();
-
     tracing_subscriber::fmt::init();
 
-    // Read configuration from environment variables
-    let backend = env::var("BACKEND_URL").expect("BACKEND_URL environment variable must be set");
-    let api_keys_str = env::var("API_KEYS").expect("API_KEYS environment variable must be set");
-    let api_keys: Vec<String> = api_keys_str
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    // Parse command-line arguments
+    let args = Args::parse();
 
-    if api_keys.is_empty() {
-        panic!("API_KEYS must contain at least one valid API key");
+    // Load configuration from TOML file
+    let config = load_config(&args.config).expect("Failed to load configuration");
+
+    info!("Loaded configuration from: {}", args.config);
+    info!("Loaded {} backends", config.backends.len());
+    for backend in &config.backends {
+        info!("  - {} (weight: {})", backend.url, backend.weight);
     }
 
-    let port: u16 = env::var("PORT")
-        .unwrap_or_else(|_| "28899".to_string())
-        .parse()
-        .expect("PORT must be a valid number");
+    if !config.method_routes.is_empty() {
+        info!("Method routing overrides:");
+        for (method, url) in &config.method_routes {
+            info!("  - {} -> {}", method, url);
+        }
+    }
+
+    let total_weight: u32 = config.backends.iter().map(|b| b.weight).sum();
 
     let https = HttpsConnector::new();
     let state = Arc::new(AppState {
         client: Client::builder(hyper_util::rt::TokioExecutor::new()).build(https),
-        backend,
-        api_keys,
+        backends: config.backends,
+        total_weight,
+        api_keys: config.api_keys,
+        method_routes: config.method_routes,
     });
 
     let app = Router::new()
@@ -194,7 +287,7 @@ async fn main() {
         .layer(middleware::from_fn(log_requests))
         .layer(middleware::from_fn(extract_rpc_method));
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
     println!("Listening on http://{}", addr);
 
     axum::serve(
