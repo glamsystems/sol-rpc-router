@@ -22,8 +22,8 @@ enum Commands {
     Create {
         /// Owner identifier (e.g. client-name)
         owner: String,
-        /// Rate limit (requests per minute)
-        #[arg(long, default_value_t = 600)]
+        /// Rate limit (requests per second)
+        #[arg(long, default_value_t = 10)]
         rate_limit: u64,
         /// Expiration timestamp (optional)
         #[arg(long)]
@@ -48,7 +48,6 @@ struct KeyMetadata {
     created_at: u64,
     expires_at: Option<u64>,
     rate_limit: u64,
-    rate_limit_window: u64,
 }
 
 #[tokio::main]
@@ -137,7 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Key: {}", key);
                 println!("Owner: {}", owner);
                 println!("Active: {}", active);
-                println!("Rate Limit: {}", rate_limit);
+                println!("Rate Limit: {} RPS", rate_limit);
                 println!("Created At: {}", created_at);
             } else {
                 println!("Key not found");

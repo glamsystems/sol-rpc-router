@@ -75,7 +75,7 @@ impl RedisKeyStore {
         // Atomic INCR and Expire if needed
         // Script to ensure atomicity: INCR key; IF == 1 THEN EXPIRE key 1; END; RETURN val
         let script = redis::Script::new(r#"
-            let count = redis.call("INCR", KEYS[1])
+            local count = redis.call("INCR", KEYS[1])
             if count == 1 then
                 redis.call("EXPIRE", KEYS[1], 1)
             end
