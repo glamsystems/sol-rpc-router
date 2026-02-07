@@ -65,8 +65,8 @@ cargo build --release --bin rpc-admin
 
 1. **Create a Key**:
    ```bash
-   # Create key for client-a with 600 req/min limit
-   ./target/release/rpc-admin create client-a --rate-limit 600
+   # Create key for client-a with 10 req/sec limit
+   ./target/release/rpc-admin create client-a --rate-limit 10
    ```
 
 2. **List Keys**:
