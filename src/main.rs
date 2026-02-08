@@ -3,7 +3,10 @@ mod handlers;
 mod health;
 mod state;
 
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{
+    net::SocketAddr,
+    sync::{atomic::AtomicBool, Arc},
+};
 
 use axum::{
     middleware,
@@ -16,7 +19,7 @@ use handlers::{extract_rpc_method, health_endpoint, log_requests, proxy, ws_prox
 use health::{health_check_loop, HealthState};
 use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::Client;
-use state::AppState;
+use state::{AppState, RuntimeBackend};
 use tracing::info;
 
 #[derive(Parser, Debug)]
@@ -54,11 +57,14 @@ async fn main() {
         }
     }
 
-    // Build label-to-URL mapping
-    let label_to_url: HashMap<String, String> = config
+    // Initialize runtime backends with atomic health status
+    let runtime_backends: Vec<RuntimeBackend> = config
         .backends
         .iter()
-        .map(|b| (b.label.clone(), b.url.clone()))
+        .map(|b| RuntimeBackend {
+            config: b.clone(),
+            healthy: Arc::new(AtomicBool::new(true)), // Default to healthy
+        })
         .collect();
 
     // Initialize health state
@@ -70,17 +76,16 @@ async fn main() {
 
     let state = Arc::new(AppState {
         client: client.clone(),
-        backends: config.backends.clone(),
+        backends: runtime_backends.clone(),
         api_keys: config.api_keys,
         method_routes: config.method_routes,
-        label_to_url,
         health_state: health_state.clone(),
         proxy_timeout_secs: config.proxy.timeout_secs,
     });
 
     // Spawn background health check task
     let health_check_client = client.clone();
-    let health_check_backends = config.backends.clone();
+    let health_check_backends = runtime_backends; // Move the runtime backends here
     let health_check_config = config.health_check.clone();
 
     tokio::spawn(async move {
