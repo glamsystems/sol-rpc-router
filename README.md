@@ -1,119 +1,139 @@
-# RPC Router
+# sol-rpc-router
 
-A high-performance HTTP router for Solana RPC requests with Redis-backed API key authentication, rate limiting, weighted load balancing, and method-based routing.
+A high-performance reverse-proxy for Solana JSON-RPC and WebSocket endpoints with Redis-backed API key authentication, per-key rate limiting, weighted load balancing, method-based routing, and automatic health checks.
 
 ## Features
 
-- **API Key Authentication**: Validates requests using query parameter `?api-key=` against Redis.
-- **Rate Limiting**: Enforces per-key rate limits (requests per second) using Redis + local caching.
-- **Weighted Load Balancing**: Distribute requests across multiple backends with configurable weights.
-- **Method-Based Routing**: Route specific RPC methods to designated backends.
-- **Health Checks**: Automatically monitor backend health and route around unhealthy backends.
-- **Request Logging**: Logs request information including RPC method, path, client IP, and duration.
-- **Health Monitoring**: GET /health endpoint for external monitoring tools.
+- **API Key Authentication** -- query parameter `?api-key=` validated against Redis with local caching (moka, 60 s TTL).
+- **Rate Limiting** -- per-key RPS limits enforced atomically in Redis (INCR + EXPIRE Lua script).
+- **Weighted Load Balancing** -- distribute requests across backends by configurable weight; unhealthy backends are automatically excluded.
+- **Method-Based Routing** -- pin specific RPC methods (e.g. `getSlot`) to designated backends.
+- **WebSocket Proxying** -- separate WS server (HTTP port + 1) with the same auth, rate limiting, and weighted backend selection.
+- **Health Checks** -- background loop calls a configurable RPC method per backend; consecutive-failure / consecutive-success thresholds control status transitions.
+- **Prometheus Metrics** -- `GET /metrics` exposes request counts, latencies, and backend health gauges.
+- **Admin CLI** (`rpc-admin`) -- create, list, inspect, and revoke API keys in Redis.
 
 ## Prerequisites
 
-- **Redis**: Required for storing API keys and rate limiting counters.
+- Rust 2021 edition (stable)
+- Redis (for API key storage and rate limiting)
+
+## Quick Start
+
+```bash
+# Build
+cargo build --release
+
+# Run the router (requires Redis running)
+./target/release/sol-rpc-router --config config.toml
+
+# Create an API key
+./target/release/rpc-admin create my-client --rate-limit 50
+```
 
 ## Configuration
 
-The router uses a TOML configuration file.
+The router reads a TOML file (default `config.toml`).
 
-1. Create `config.toml`:
+```toml
+port = 28899                          # HTTP; WebSocket listens on 28900
+redis_url = "redis://127.0.0.1:6379/0"
 
-   ```toml
-   # Server port (HTTP JSON-RPC)
-   # WebSocket server automatically runs on port + 1
-   port = 28899
+[[backends]]
+label = "mainnet-primary"
+url = "https://api.mainnet-beta.solana.com"
+weight = 10
+ws_url = "wss://api.mainnet-beta.solana.com"   # optional
 
-   # Redis Connection URL
-   redis_url = "redis://127.0.0.1:6379/0"
+[[backends]]
+label = "backup-rpc"
+url = "https://solana-api.com"
+weight = 5
 
-   # Backend RPC endpoints with weights
-   [[backends]]
-   label = "mainnet-beta"
-   url = "https://api.mainnet-beta.solana.com"
-   weight = 10
+[proxy]
+timeout_secs = 30                     # upstream request timeout
 
-   [[backends]]
-   label = "backup-rpc"
-   url = "https://solana-api.com"
-   weight = 5
+[health_check]
+interval_secs = 30                    # check frequency
+timeout_secs = 5                      # per-check timeout
+method = "getSlot"                    # RPC method used for probes
+consecutive_failures_threshold = 3    # failures before marking unhealthy
+consecutive_successes_threshold = 2   # successes before marking healthy
 
-   # Proxy settings
-   [proxy]
-   timeout_secs = 30
+[method_routes]                       # optional per-method overrides
+getSlot = "mainnet-primary"
+```
 
-   # Health check configuration
-   [health_check]
-   interval_secs = 30
-   timeout_secs = 5
-   method = "getSlot"
-   ```
+### Config Validation
+
+`load_config()` enforces:
+
+- `redis_url` must be non-empty.
+- At least one backend required; labels must be unique and non-empty.
+- Backend weights must be > 0.
+- `proxy.timeout_secs` must be > 0.
+- `method_routes` values must reference existing backend labels.
 
 ## Key Management CLI
 
-Use the built-in `rpc-admin` CLI to manage API keys.
-
-**Build:**
 ```bash
-cargo build --release --bin rpc-admin
+# Create a key (auto-generated)
+rpc-admin create <owner> --rate-limit 10
+
+# Create with a specific key value
+rpc-admin create <owner> --rate-limit 10 --key my-custom-key
+
+# List all keys
+rpc-admin list
+
+# Inspect a key
+rpc-admin inspect <api_key>
+
+# Revoke a key
+rpc-admin revoke <api_key>
 ```
 
-**Commands:**
+Redis URL can be set via `--redis-url` flag or `REDIS_URL` env var (default `redis://127.0.0.1:6379`).
 
-1. **Create a Key**:
-   ```bash
-   # Create key for client-a with 10 req/sec limit
-   ./target/release/rpc-admin create client-a --rate-limit 10
-   ```
+## Endpoints
 
-2. **List Keys**:
-   ```bash
-   ./target/release/rpc-admin list
-   ```
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/` | POST | Proxy JSON-RPC requests (requires `?api-key=`) |
+| `/*path` | POST | Proxy with subpath |
+| `/health` | GET | Backend health status (JSON) |
+| `/metrics` | GET | Prometheus metrics |
+| `ws://host:port+1/` | WS | WebSocket proxy (requires `?api-key=`) |
 
-3. **Get Key Info**:
-   ```bash
-   ./target/release/rpc-admin inspect <api_key>
-   ```
+## Architecture
 
-4. **Revoke Key**:
-   ```bash
-   ./target/release/rpc-admin revoke <api_key>
-   ```
+```
+src/
+  main.rs         -- entry point, server setup
+  config.rs       -- TOML config loading & validation
+  state.rs        -- AppState, select_backend(), select_ws_backend()
+  handlers.rs     -- proxy, ws_proxy, health_endpoint, middleware
+  health.rs       -- HealthState, health_check_loop
+  keystore.rs     -- KeyStore trait, RedisKeyStore
+  mock.rs         -- MockKeyStore for tests
+  bin/rpc-admin.rs -- admin CLI
 
-**Redis Configuration:**
-By default, `rpc-admin` connects to `redis://127.0.0.1:6379`.
-To change this, set the `REDIS_URL` environment variable or use the `--redis-url` flag:
-
-```bash
-export REDIS_URL="redis://redis-host:6379"
-./target/release/rpc-admin list
+tests/
+  config_test.rs  -- config validation (10 tests)
+  handler_test.rs -- proxy, health, middleware (12 tests)
+  keystore_test.rs -- mock keystore (6 tests)
+  routing_test.rs -- backend selection (7 tests)
 ```
 
-## Running the Router
-
-1. Ensure Redis is running.
-2. Run the server:
-
-   ```bash
-   cargo run --release -- --config config.toml
-   ```
-
-3. Make requests:
-
-   ```bash
-   curl -X POST -H "Content-Type: application/json" \
-     -d '{"jsonrpc":"2.0","id":1,"method":"getSlot"}' \
-     "http://localhost:28899?api-key=YOUR_API_KEY"
-   ```
-
-## Health Monitoring
-
-The `/health` endpoint exposes backend status:
+## Testing
 
 ```bash
-curl http://localhost:28899/health
+cargo test               # run all 35 tests
+cargo test -- --list     # list test names
 ```
+
+All tests use mocks only -- no Redis or real HTTP backends required (except localhost mock servers started in-process).
+
+## License
+
+See repository for license details.
