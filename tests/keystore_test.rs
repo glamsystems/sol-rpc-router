@@ -47,3 +47,26 @@ async fn test_validate_key_rate_limit() {
     assert!(result.is_err());
     assert_eq!(result.err().unwrap(), "Rate limit exceeded");
 }
+
+#[tokio::test]
+async fn test_validate_key_call_count() {
+    let store = MockKeyStore::new();
+    store.add_key("count-key", "owner", 100);
+
+    store.validate_key("count-key").await.unwrap();
+    store.validate_key("count-key").await.unwrap();
+    store.validate_key("count-key").await.unwrap();
+
+    assert_eq!(store.get_call_count("count-key"), 3);
+}
+
+#[tokio::test]
+async fn test_validate_key_custom_error() {
+    let store = MockKeyStore::new();
+    store.add_key("err-key", "owner", 100);
+    store.set_error("err-key", "Redis connection failed");
+
+    let result = store.validate_key("err-key").await;
+    assert!(result.is_err());
+    assert_eq!(result.err().unwrap(), "Redis connection failed");
+}

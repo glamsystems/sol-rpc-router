@@ -103,3 +103,93 @@ fn test_select_backend_unhealthy_fallback() {
     let (label, _) = state.select_backend(None).unwrap();
     assert_eq!(label, "secondary");
 }
+
+#[test]
+fn test_select_backend_all_unhealthy() {
+    let state = create_test_state();
+    for label in &["primary", "secondary"] {
+        let mut status = BackendHealthStatus::default();
+        status.healthy = false;
+        state.health_state.update_status(label, status);
+    }
+    assert!(state.select_backend(None).is_none());
+}
+
+// --- WebSocket backend selection tests ---
+
+fn create_ws_test_state() -> AppState {
+    let https = HttpsConnector::new();
+    let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build(https);
+    let keystore = Arc::new(MockKeyStore::new());
+
+    let backends = vec![
+        Backend {
+            label: "ws-a".to_string(),
+            url: "http://ws-a".to_string(),
+            ws_url: Some("ws://ws-a".to_string()),
+            weight: 1,
+        },
+        Backend {
+            label: "ws-b".to_string(),
+            url: "http://ws-b".to_string(),
+            ws_url: Some("ws://ws-b".to_string()),
+            weight: 1,
+        },
+    ];
+
+    let backend_labels = backends.iter().map(|b| b.label.clone()).collect();
+    let health_state = Arc::new(HealthState::new(backend_labels));
+    let label_to_url = backends
+        .iter()
+        .map(|b| (b.label.clone(), b.url.clone()))
+        .collect();
+
+    AppState {
+        client,
+        backends,
+        keystore,
+        method_routes: HashMap::new(),
+        label_to_url,
+        health_state,
+        proxy_timeout_secs: 10,
+    }
+}
+
+#[test]
+fn test_select_ws_backend_weighted() {
+    let state = create_ws_test_state();
+    let mut a_count = 0;
+    let mut b_count = 0;
+
+    for _ in 0..1000 {
+        let (label, url) = state.select_ws_backend().unwrap();
+        assert!(url.starts_with("ws://"));
+        if label == "ws-a" {
+            a_count += 1;
+        } else {
+            b_count += 1;
+        }
+    }
+
+    assert!(a_count > 400, "ws-a selected {} times", a_count);
+    assert!(b_count > 400, "ws-b selected {} times", b_count);
+}
+
+#[test]
+fn test_select_ws_backend_no_ws_urls() {
+    let state = create_test_state(); // backends have no ws_url
+    assert!(state.select_ws_backend().is_none());
+}
+
+#[test]
+fn test_select_ws_backend_unhealthy_excluded() {
+    let state = create_ws_test_state();
+    let mut unhealthy = BackendHealthStatus::default();
+    unhealthy.healthy = false;
+    state.health_state.update_status("ws-a", unhealthy);
+
+    for _ in 0..100 {
+        let (label, _) = state.select_ws_backend().unwrap();
+        assert_eq!(label, "ws-b");
+    }
+}

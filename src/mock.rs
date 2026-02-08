@@ -13,6 +13,7 @@ pub struct MockKeyStore {
     pub call_counts: Arc<Mutex<HashMap<String, u64>>>,
     pub inactive_keys: Arc<Mutex<Vec<String>>>,
     pub rate_limited_keys: Arc<Mutex<Vec<String>>>,
+    pub error_keys: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl MockKeyStore {
@@ -22,6 +23,7 @@ impl MockKeyStore {
             call_counts: Arc::new(Mutex::new(HashMap::new())),
             inactive_keys: Arc::new(Mutex::new(Vec::new())),
             rate_limited_keys: Arc::new(Mutex::new(Vec::new())),
+            error_keys: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -42,6 +44,13 @@ impl MockKeyStore {
     pub fn get_call_count(&self, key: &str) -> u64 {
         *self.call_counts.lock().unwrap().get(key).unwrap_or(&0)
     }
+
+    pub fn set_error(&self, key: &str, msg: &str) {
+        self.error_keys
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), msg.to_string());
+    }
 }
 
 #[async_trait]
@@ -49,6 +58,12 @@ impl KeyStore for MockKeyStore {
     async fn validate_key(&self, key: &str) -> Result<Option<KeyInfo>, String> {
         let mut counts = self.call_counts.lock().unwrap();
         *counts.entry(key.to_string()).or_insert(0) += 1;
+        drop(counts);
+
+        // Check for custom errors first
+        if let Some(msg) = self.error_keys.lock().unwrap().get(key) {
+            return Err(msg.clone());
+        }
 
         if self
             .inactive_keys
@@ -60,7 +75,6 @@ impl KeyStore for MockKeyStore {
         }
 
         if let Some(info) = self.keys.lock().unwrap().get(key) {
-            // Check rate limit (simple check against strict list for testing)
             if self
                 .rate_limited_keys
                 .lock()
@@ -69,14 +83,6 @@ impl KeyStore for MockKeyStore {
             {
                 return Err("Rate limit exceeded".to_string());
             }
-
-            // Also check implied rate limit if we tracked time, but for mock, we trust the explicit list
-            // or we could implement a counter reset. For simplicity, let's assume we manually trigger limit.
-
-            // Actually, let's implement the logic requested:
-            // "Test validate_key scenarios: ... rate limit exceeded"
-            // If the mock needs to simulate dynamic rate limiting, we need timestamps.
-            // But usually mocks are configured.
 
             return Ok(Some(info.clone()));
         }
