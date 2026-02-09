@@ -28,6 +28,9 @@ enum Commands {
         /// Expiration timestamp (optional)
         #[arg(long)]
         expires_at: Option<u64>,
+        /// Custom API key value (auto-generated if omitted)
+        #[arg(long)]
+        key: Option<String>,
     },
     /// Revoke an API key
     Revoke { key: String },
@@ -48,12 +51,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             owner,
             rate_limit,
             expires_at,
+            key: custom_key,
         } => {
-            let key: String = rand::thread_rng()
-                .sample_iter(&Alphanumeric)
-                .take(32)
-                .map(char::from)
-                .collect();
+            let key: String = custom_key.unwrap_or_else(|| {
+                rand::thread_rng()
+                    .sample_iter(&Alphanumeric)
+                    .take(32)
+                    .map(char::from)
+                    .collect()
+            });
 
             let redis_key = format!("api_key:{}", key);
 
