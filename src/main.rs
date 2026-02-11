@@ -79,7 +79,7 @@ async fn main() {
     let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build(https);
 
     // Initialize Redis KeyStore
-    let keystore = match RedisKeyStore::new(&config.redis_url) {
+    let keystore = match RedisKeyStore::new(&config.redis_url).await {
         Ok(ks) => ks,
         Err(e) => {
             error!("Failed to initialize Redis KeyStore: {}", e);

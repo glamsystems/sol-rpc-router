@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use moka::future::Cache;
-use redis::Client;
+use redis::{aio::ConnectionManager, Client};
 
 #[derive(Clone, Debug)]
 pub struct KeyInfo {
@@ -16,19 +16,23 @@ pub trait KeyStore: Send + Sync {
 }
 
 pub struct RedisKeyStore {
-    client: Client,
+    conn: ConnectionManager,
     cache: Cache<String, Option<KeyInfo>>,
 }
 
 impl RedisKeyStore {
-    pub fn new(redis_url: &str) -> Result<Self, String> {
+    pub async fn new(redis_url: &str) -> Result<Self, String> {
         let client = Client::open(redis_url).map_err(|e| e.to_string())?;
+        let conn = client
+            .get_connection_manager()
+            .await
+            .map_err(|e| e.to_string())?;
 
         let cache = Cache::builder()
             .time_to_live(Duration::from_secs(60)) // Cache keys for 1 min
             .build();
 
-        Ok(Self { client, cache })
+        Ok(Self { conn, cache })
     }
 
     async fn get_key_info(&self, key: &str) -> Result<Option<KeyInfo>, String> {
@@ -38,11 +42,7 @@ impl RedisKeyStore {
         }
 
         // Check Redis
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| e.to_string())?;
+        let mut conn = self.conn.clone();
 
         let redis_key = format!("api_key:{}", key);
         // Check if exists first to avoid errors on empty keys
@@ -93,11 +93,7 @@ impl RedisKeyStore {
             return Ok(true); // No limit
         }
 
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| e.to_string())?;
+        let mut conn = self.conn.clone();
         let redis_key = format!("rate_limit:{}", key);
 
         // Atomic INCR and Expire if needed
