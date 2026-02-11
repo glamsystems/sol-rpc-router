@@ -58,11 +58,12 @@ impl HealthState {
     }
 
     pub fn update_status(&self, label: &str, status: BackendHealthStatus) {
-        if let Some(s) = self.statuses.write().unwrap().get_mut(label) {
+        let mut statuses = self.statuses.write().unwrap();
+        if let Some(s) = statuses.get_mut(label) {
             *s = status;
         } else {
-             // If backend is new (hot reload), insert it
-             self.statuses.write().unwrap().insert(label.to_string(), status);
+            // If backend is new (hot reload), insert it
+            statuses.insert(label.to_string(), status);
         }
     }
 

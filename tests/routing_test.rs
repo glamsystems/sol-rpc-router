@@ -1,13 +1,14 @@
 use std::{collections::HashMap, sync::Arc};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use arc_swap::ArcSwap;
 use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use sol_rpc_router::{
-    config::Backend,
+    config::{Backend, HealthCheckConfig},
     health::{BackendHealthStatus, HealthState},
     mock::MockKeyStore,
-    state::{AppState, RuntimeBackend},
+    state::{AppState, RouterState, RuntimeBackend},
 };
 
 fn create_test_state() -> AppState {
@@ -41,21 +42,66 @@ fn create_test_state() -> AppState {
     let backend_labels = backend_configs.iter().map(|b| b.label.clone()).collect();
     let health_state = Arc::new(HealthState::new(backend_labels));
 
-    AppState {
-        client,
+    let router_state = RouterState {
         backends,
-        keystore,
         method_routes: HashMap::new(),
         health_state,
         proxy_timeout_secs: 10,
+        health_check_config: HealthCheckConfig::default(),
+    };
+
+    AppState {
+        client,
+        keystore,
+        state: Arc::new(ArcSwap::from_pointee(router_state)),
     }
 }
 
 #[test]
 fn test_select_backend_weighted() {
-    let mut state = create_test_state();
-    state.backends[0].config.weight = 1;
-    state.backends[1].config.weight = 1;
+    let https = HttpsConnector::new();
+    let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build(https);
+    let keystore = Arc::new(MockKeyStore::new());
+
+    let backends = vec![
+        RuntimeBackend {
+            config: Backend {
+                label: "primary".to_string(),
+                url: "http://primary".to_string(),
+                ws_url: None,
+                weight: 1,
+            },
+            healthy: Arc::new(AtomicBool::new(true)),
+        },
+        RuntimeBackend {
+            config: Backend {
+                label: "secondary".to_string(),
+                url: "http://secondary".to_string(),
+                ws_url: None,
+                weight: 1,
+            },
+            healthy: Arc::new(AtomicBool::new(true)),
+        },
+    ];
+
+    let health_state = Arc::new(HealthState::new(vec![
+        "primary".to_string(),
+        "secondary".to_string(),
+    ]));
+
+    let router_state = RouterState {
+        backends,
+        method_routes: HashMap::new(),
+        health_state,
+        proxy_timeout_secs: 10,
+        health_check_config: HealthCheckConfig::default(),
+    };
+
+    let state = AppState {
+        client,
+        keystore,
+        state: Arc::new(ArcSwap::from_pointee(router_state)),
+    };
 
     let iterations = 1000;
     let mut primary_count = 0;
@@ -77,32 +123,73 @@ fn test_select_backend_weighted() {
 
 #[test]
 fn test_select_backend_method_override() {
-    let mut state = create_test_state();
-    state
-        .method_routes
-        .insert("eth_call".to_string(), "secondary".to_string());
+    let https = HttpsConnector::new();
+    let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build(https);
+    let keystore = Arc::new(MockKeyStore::new());
+
+    let backends = vec![
+        RuntimeBackend {
+            config: Backend {
+                label: "primary".to_string(),
+                url: "http://primary".to_string(),
+                ws_url: None,
+                weight: 100,
+            },
+            healthy: Arc::new(AtomicBool::new(true)),
+        },
+        RuntimeBackend {
+            config: Backend {
+                label: "secondary".to_string(),
+                url: "http://secondary".to_string(),
+                ws_url: None,
+                weight: 0,
+            },
+            healthy: Arc::new(AtomicBool::new(true)),
+        },
+    ];
+
+    let health_state = Arc::new(HealthState::new(vec![
+        "primary".to_string(),
+        "secondary".to_string(),
+    ]));
+
+    let mut method_routes = HashMap::new();
+    method_routes.insert("eth_call".to_string(), "secondary".to_string());
+
+    let router_state = RouterState {
+        backends,
+        method_routes,
+        health_state,
+        proxy_timeout_secs: 10,
+        health_check_config: HealthCheckConfig::default(),
+    };
+
+    let state = AppState {
+        client,
+        keystore,
+        state: Arc::new(ArcSwap::from_pointee(router_state)),
+    };
 
     let (label, _) = state.select_backend(Some("eth_call")).unwrap();
     assert_eq!(label, "secondary");
 
     let (label, _) = state.select_backend(Some("eth_blockNumber")).unwrap();
-    let label_str = label.to_string(); // Clone to drop borrow
-
-    // Re-setup effectively by just checking the logic directly
-    // With weight 0 for secondary in create_test_state, it should be primary
-    assert_eq!(label_str, "primary");
+    // With weight 0 for secondary, it should be primary
+    assert_eq!(label, "primary");
 }
 
 #[test]
 fn test_select_backend_unhealthy_fallback() {
     let state = create_test_state();
-    // Mark primary as unhealthy (update AtomicBool directly for hot path)
-    state.backends[0].healthy.store(false, Ordering::Relaxed);
-    
-    // Also update health_state for consistency (though select_backend uses AtomicBool)
+    let loaded = state.state.load();
+
+    // Mark primary as unhealthy
+    loaded.backends[0].healthy.store(false, Ordering::Relaxed);
+
+    // Also update health_state for consistency
     let mut status = BackendHealthStatus::default();
     status.healthy = false;
-    state.health_state.update_status("primary", status);
+    loaded.health_state.update_status("primary", status);
 
     let (label, _) = state.select_backend(None).unwrap();
     assert_eq!(label, "secondary");
@@ -111,10 +198,11 @@ fn test_select_backend_unhealthy_fallback() {
 #[test]
 fn test_select_backend_all_unhealthy() {
     let state = create_test_state();
-    for backend in &state.backends {
+    let loaded = state.state.load();
+    for backend in &loaded.backends {
         backend.healthy.store(false, Ordering::Relaxed);
     }
-    
+
     assert!(state.select_backend(None).is_none());
 }
 
@@ -151,13 +239,18 @@ fn create_ws_test_state() -> AppState {
     let backend_labels = backend_configs.iter().map(|b| b.label.clone()).collect();
     let health_state = Arc::new(HealthState::new(backend_labels));
 
-    AppState {
-        client,
+    let router_state = RouterState {
         backends,
-        keystore,
         method_routes: HashMap::new(),
         health_state,
         proxy_timeout_secs: 10,
+        health_check_config: HealthCheckConfig::default(),
+    };
+
+    AppState {
+        client,
+        keystore,
+        state: Arc::new(ArcSwap::from_pointee(router_state)),
     }
 }
 
@@ -190,9 +283,10 @@ fn test_select_ws_backend_no_ws_urls() {
 #[test]
 fn test_select_ws_backend_unhealthy_excluded() {
     let state = create_ws_test_state();
-    
+    let loaded = state.state.load();
+
     // Mark ws-a as unhealthy via AtomicBool
-    state.backends[0].healthy.store(false, Ordering::Relaxed);
+    loaded.backends[0].healthy.store(false, Ordering::Relaxed);
 
     for _ in 0..100 {
         let (label, _) = state.select_ws_backend().unwrap();

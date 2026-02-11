@@ -1,6 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 use std::sync::atomic::AtomicBool;
 
+use arc_swap::ArcSwap;
 use axum::{
     body::Body,
     http::{Request, StatusCode},
@@ -12,13 +13,34 @@ use http_body_util::BodyExt;
 use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use sol_rpc_router::{
-    config::Backend,
+    config::{Backend, HealthCheckConfig},
     handlers::{extract_rpc_method, health_endpoint, proxy, RpcMethod},
     health::{BackendHealthStatus, HealthState},
     mock::MockKeyStore,
-    state::{AppState, RuntimeBackend},
+    state::{AppState, RouterState, RuntimeBackend},
 };
 use tower::ServiceExt; // for oneshot
+
+fn make_app_state(
+    client: Client<HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>, Body>,
+    keystore: Arc<MockKeyStore>,
+    backends: Vec<RuntimeBackend>,
+    health_state: Arc<HealthState>,
+) -> Arc<AppState> {
+    let router_state = RouterState {
+        backends,
+        method_routes: HashMap::new(),
+        health_state,
+        proxy_timeout_secs: 5,
+        health_check_config: HealthCheckConfig::default(),
+    };
+
+    Arc::new(AppState {
+        client,
+        keystore,
+        state: Arc::new(ArcSwap::from_pointee(router_state)),
+    })
+}
 
 async fn start_mock_backend() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -57,15 +79,7 @@ async fn test_proxy_handler_success() {
     };
 
     let health_state = Arc::new(HealthState::new(vec!["mock-backend".to_string()]));
-
-    let state = Arc::new(AppState {
-        client,
-        backends: vec![runtime_backend],
-        keystore,
-        method_routes: HashMap::new(),
-        health_state,
-        proxy_timeout_secs: 5,
-    });
+    let state = make_app_state(client, keystore, vec![runtime_backend], health_state);
 
     let app = Router::new()
         .route("/", post(proxy))
@@ -98,14 +112,7 @@ async fn test_proxy_handler_unauthorized() {
     // No keys added
 
     let health_state = Arc::new(HealthState::new(vec![]));
-    let state = Arc::new(AppState {
-        client,
-        backends: vec![],
-        keystore,
-        method_routes: HashMap::new(),
-        health_state,
-        proxy_timeout_secs: 5,
-    });
+    let state = make_app_state(client, keystore, vec![], health_state);
 
     let app = Router::new()
         .route("/", post(proxy))
@@ -137,14 +144,7 @@ async fn test_proxy_handler_rate_limited() {
         .push("limit-key".to_string());
 
     let health_state = Arc::new(HealthState::new(vec![]));
-    let state = Arc::new(AppState {
-        client,
-        backends: vec![],
-        keystore,
-        method_routes: HashMap::new(),
-        health_state,
-        proxy_timeout_secs: 5,
-    });
+    let state = make_app_state(client, keystore, vec![], health_state);
 
     let app = Router::new()
         .route("/", post(proxy))
@@ -171,15 +171,7 @@ async fn test_proxy_no_api_key() {
     let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build(https);
     let keystore = Arc::new(MockKeyStore::new());
     let health_state = Arc::new(HealthState::new(vec![]));
-
-    let state = Arc::new(AppState {
-        client,
-        backends: vec![],
-        keystore,
-        method_routes: HashMap::new(),
-        health_state,
-        proxy_timeout_secs: 5,
-    });
+    let state = make_app_state(client, keystore, vec![], health_state);
 
     let app = Router::new()
         .route("/", post(proxy))
@@ -206,14 +198,7 @@ async fn test_proxy_keystore_internal_error() {
     keystore.set_error("err-key", "Redis connection failed");
 
     let health_state = Arc::new(HealthState::new(vec![]));
-    let state = Arc::new(AppState {
-        client,
-        backends: vec![],
-        keystore,
-        method_routes: HashMap::new(),
-        health_state,
-        proxy_timeout_secs: 5,
-    });
+    let state = make_app_state(client, keystore, vec![], health_state);
 
     let app = Router::new()
         .route("/", post(proxy))
@@ -253,17 +238,7 @@ async fn test_proxy_no_healthy_backends() {
     };
 
     let health_state = Arc::new(HealthState::new(vec!["sick-backend".to_string()]));
-    // Note: HealthState is for the background loop, RuntimeBackend.healthy is for the hot path.
-    // In this test we manually set the atomic boolean.
-
-    let state = Arc::new(AppState {
-        client,
-        backends: vec![runtime_backend],
-        keystore,
-        method_routes: HashMap::new(),
-        health_state,
-        proxy_timeout_secs: 5,
-    });
+    let state = make_app_state(client, keystore, vec![runtime_backend], health_state);
 
     let app = Router::new()
         .route("/", post(proxy))
@@ -298,14 +273,7 @@ fn make_health_state(backends: &[Backend]) -> Arc<AppState> {
         })
         .collect();
 
-    Arc::new(AppState {
-        client,
-        backends: runtime_backends,
-        keystore,
-        method_routes: HashMap::new(),
-        health_state,
-        proxy_timeout_secs: 5,
-    })
+    make_app_state(client, keystore, runtime_backends, health_state)
 }
 
 fn test_backends() -> Vec<Backend> {
@@ -351,13 +319,9 @@ async fn test_health_endpoint_all_healthy() {
 async fn test_health_endpoint_mixed() {
     let state = make_health_state(&test_backends());
 
-    // Update AtomicBool for the hot path (not used by health_endpoint directly, but good practice)
-    // Actually health_endpoint reads from HealthState (RwLock), not AtomicBool.
-    // The health check loop updates both.
-    // So for this test we update HealthState.
     let mut unhealthy = BackendHealthStatus::default();
     unhealthy.healthy = false;
-    state.health_state.update_status("b", unhealthy);
+    state.state.load().health_state.update_status("b", unhealthy);
 
     let app = Router::new()
         .route("/health", get(health_endpoint))
@@ -383,10 +347,11 @@ async fn test_health_endpoint_mixed() {
 #[tokio::test]
 async fn test_health_endpoint_all_unhealthy() {
     let state = make_health_state(&test_backends());
+    let loaded = state.state.load();
     for label in &["a", "b"] {
         let mut unhealthy = BackendHealthStatus::default();
         unhealthy.healthy = false;
-        state.health_state.update_status(label, unhealthy);
+        loaded.health_state.update_status(label, unhealthy);
     }
 
     let app = Router::new()
