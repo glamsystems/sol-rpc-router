@@ -1,31 +1,27 @@
-# Server port (HTTP JSON-RPC)
-# WebSocket server automatically runs on port + 1 (Solana convention)
 port = 28899
-
-# Redis Connection URL
+metrics_port = 28901
 redis_url = "redis://127.0.0.1:6379/0"
 
-# Backend RPC endpoints with weights
 [[backends]]
-label = "backend-0"
+label = "mainnet-primary"
 url = "https://api.mainnet-beta.solana.com"
-weight = 2
+weight = 10
+ws_url = "wss://api.mainnet-beta.solana.com"   # optional
 
 [[backends]]
-label = "backend-1"
+label = "backup-rpc"
 url = "https://solana-api.com"
-weight = 1
+weight = 5
 
-# Health check configuration (optional - has defaults)
+[proxy]
+timeout_secs = 30                     # upstream request timeout
+
 [health_check]
-interval_secs = 30              # Check every 30 seconds
-timeout_secs = 5                # 5 second timeout
-method = "getSlot"              # RPC method for health checks
-consecutive_failures_threshold = 3     # Mark unhealthy after 3 failures
-consecutive_successes_threshold = 2    # Mark healthy after 2 successes
+interval_secs = 30                    # check frequency
+timeout_secs = 5                      # per-check timeout
+method = "getSlot"                    # RPC method used for probes
+consecutive_failures_threshold = 3    # failures before marking unhealthy
+consecutive_successes_threshold = 2   # successes before marking healthy
 
-# Method-specific routing overrides (optional)
-# Use backend labels to route specific methods
-[method_routes]
-getProgramAccountsV2 = "backend-0"
-sendTransaction = "backend-1"
+[method_routes]                       # optional per-method overrides
+getSlot = "mainnet-primary"
