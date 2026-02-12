@@ -190,7 +190,6 @@ async fn main() {
         .route("/", post(proxy))
         .route("/*path", post(proxy))
         .route("/health", get(health_endpoint))
-        .route("/metrics", get(move || std::future::ready(handle.render())))
         .with_state(state.clone())
         .layer(middleware::from_fn(track_metrics))
         .layer(middleware::from_fn(log_requests))
@@ -202,19 +201,24 @@ async fn main() {
         .with_state(state)
         .layer(middleware::from_fn(log_requests));
 
+    // Metrics server (dedicated port)
+    let metrics_app = Router::new()
+        .route("/metrics", get(move || std::future::ready(handle.render())));
+
     let http_addr = SocketAddr::from(([0, 0, 0, 0], config.port));
     let ws_port = config
         .port
         .checked_add(1)
         .expect("WebSocket port overflow: HTTP port cannot be 65535");
     let ws_addr = SocketAddr::from(([0, 0, 0, 0], ws_port));
+    let metrics_addr = SocketAddr::from(([0, 0, 0, 0], config.metrics_port));
 
     info!("HTTP server listening on http://{}", http_addr);
     info!("WebSocket server listening on ws://{}", ws_addr);
+    info!("Metrics server listening on http://{}", metrics_addr);
     info!("Health monitoring endpoint: http://{}/health", http_addr);
-    info!("Metrics endpoint: http://{}/metrics", http_addr);
 
-    // Start both servers concurrently
+    // Start all servers concurrently
     let http_server = async {
         axum::serve(
             tokio::net::TcpListener::bind(http_addr)
@@ -237,5 +241,16 @@ async fn main() {
         .expect("WebSocket server error");
     };
 
-    tokio::join!(http_server, ws_server);
+    let metrics_server = async {
+        axum::serve(
+            tokio::net::TcpListener::bind(metrics_addr)
+                .await
+                .expect("Failed to bind Metrics server"),
+            metrics_app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .expect("Metrics server error");
+    };
+
+    tokio::join!(http_server, ws_server, metrics_server);
 }
