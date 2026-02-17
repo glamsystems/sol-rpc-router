@@ -36,6 +36,7 @@ pub struct HealthCheckConfig {
     pub method: String,
     pub consecutive_failures_threshold: u32,
     pub consecutive_successes_threshold: u32,
+    pub max_slot_lag: u64,
 }
 
 impl Default for HealthCheckConfig {
@@ -46,6 +47,7 @@ impl Default for HealthCheckConfig {
             method: "getSlot".to_string(),
             consecutive_failures_threshold: 3,
             consecutive_successes_threshold: 2,
+            max_slot_lag: 50,
         }
     }
 }
