@@ -268,16 +268,28 @@ pub async fn proxy(
         }
         Ok(Err(err)) => {
             info!("Backend request failed: {} (error type: {:?})", err, err);
-            (StatusCode::BAD_GATEWAY, format!("Proxy error: {}", err)).into_response()
+            let mut resp =
+                (StatusCode::BAD_GATEWAY, format!("Proxy error: {}", err)).into_response();
+            resp.extensions_mut()
+                .insert(SelectedBackend(backend_label.to_string()));
+            if let Some(owner) = client_owner {
+                resp.extensions_mut().insert(owner);
+            }
+            resp
         }
-        Err(_) => (
-            StatusCode::GATEWAY_TIMEOUT,
-            format!(
-                "Upstream request timed out after {}s",
-                proxy_timeout
-            ),
-        )
-            .into_response(),
+        Err(_) => {
+            let mut resp = (
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("Upstream request timed out after {}s", proxy_timeout),
+            )
+                .into_response();
+            resp.extensions_mut()
+                .insert(SelectedBackend(backend_label.to_string()));
+            if let Some(owner) = client_owner {
+                resp.extensions_mut().insert(owner);
+            }
+            resp
+        }
     }
 }
 
