@@ -190,9 +190,9 @@ async fn main() {
         }
     });
 
-    // HTTP server (JSON-RPC over HTTP)
+    // HTTP server (JSON-RPC over HTTP + WebSocket on same port)
     let http_app = Router::new()
-        .route("/", post(proxy))
+        .route("/", get(ws_proxy).post(proxy))
         .route("/*path", post(proxy))
         .route("/health", get(health_endpoint))
         .with_state(state.clone())
